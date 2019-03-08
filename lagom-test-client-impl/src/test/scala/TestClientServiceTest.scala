@@ -1,5 +1,8 @@
+import akka.NotUsed
 import akka.event.Logging
-import akka.stream.scaladsl.Source
+import akka.stream.OverflowStrategy
+import akka.stream.QueueOfferResult.Enqueued
+import akka.stream.scaladsl.{Source, SourceQueueWithComplete}
 import akka.stream.testkit.scaladsl.TestSink
 import com.lightbend.lagom.scaladsl.server.LocalServiceLocator
 import com.lightbend.lagom.scaladsl.testkit.ServiceTest
@@ -8,6 +11,8 @@ import org.scalatest.concurrent.ScalaFutures
 import org.scalatest.time.{Seconds, Span}
 import org.scalatest.{AsyncWordSpec, Matchers}
 import play.api.Logger
+
+import scala.concurrent.Promise
 
 
 class TestClientServiceTest extends AsyncWordSpec with Matchers with ScalaFutures  {
@@ -67,18 +72,29 @@ class TestClientServiceTest extends AsyncWordSpec with Matchers with ScalaFuture
 
       val testClient = server.serviceClient.implement[LagomTestApi]
 
+      val queuePromise = Promise[SourceQueueWithComplete[String]]()
+
       val documents = List("one", "two", "three")
 
-      val input = Source(documents).concat(Source.maybe)
+      val input =
+        Source.queue[String](20, OverflowStrategy.dropNew)
+            .mapMaterializedValue(queue => {
+              queuePromise.success(queue)
+              NotUsed
+            })
 
       testClient.echo.invoke(input).map { output =>
 
         val probe = output.runWith(TestSink.probe(server.actorSystem))
-        probe.request(documents.length)
+        val queue = queuePromise.future.futureValue
+        for (document <- documents) {
+          probe.request(1)
+          queue.offer(document).futureValue should be(Enqueued)
+          probe.expectNext() should be(document)
+        }
 
-        val paired = List("one", "two", "three")
-
-        probe.expectNextUnorderedN(paired)
+        queue.complete()
+        probe.expectComplete()
 
         succeed
       }
